@@ -21,6 +21,21 @@ typedef unsigned int UINT;
 #define STR_MAX 2048
 const char *libName="../lib.so";  //this is the library we are going to inject
 
+void dump(pid_t tid,int start=-3,int end=3)
+{
+    //debug this as well
+    user uregs={};
+    auto er=ptrace(PTRACE_GETREGS,tid,NULL,&uregs);
+
+    unsigned char data=3;
+    for(int i=start;i<end;++i)
+    {
+        data=ptrace(PTRACE_PEEKTEXT,tid,uregs.regs.rip-i,&data);
+        unsigned int ui=data;
+        printf("RIP:%lx %x\n",uregs.regs.rip-i,ui);
+    }
+}
+
 void *FindSoAddress(const char *strLibName,pid_t pid) //all this to defeat ASLR
 {
     char str[STR_MAX]="";
@@ -90,10 +105,10 @@ void RestoreMemory(pid_t rpid,user originalRegs)
     ptrace(PTRACE_SETREGS,rpid,NULL,&originalRegs);
 }
 
-unsigned char data_opcodes[50]="";
+unsigned char data_opcodes[50]={};
 void WriteProcessMemory(const unsigned int rpid,user uregs={})
 {
-    char *str = libName;
+    const char *str = libName;
     memcpy(data_opcodes, str,strlen(str)+1);  //copied the name of the so
 
     unsigned char MovRaxtoRDI[] = { 0x48, 0x8B, 0xf8 };  //these are the opcodes for move RAX=>RDI
@@ -137,7 +152,9 @@ void WriteProcessMemory(const unsigned int rpid,user uregs={})
 
     /*(5)*/
     p = FindFuncAddr("libdl",dlopen,rpid);  //find out where libdl is loaded in the remote process, this is randomly loaded for every process (thanks to ASLR)
-    memcpy(&MovtoRax[2], &p, 8);  //move function address to RAX->call RAX (in this case Sleep)
+    printf("remote address for dlopen %lx\n",p);
+
+    memcpy(&MovtoRax[2], &p, 8);  //move function address to RAX->call RAX
     memcpy(opcodes + sizeof(MovtoRax) + sizeof(MovRaxtoRDI) + sizeof(Mov1toRBX) + sizeof(MovRBXtoRSI), MovtoRax, sizeof(MovtoRax));
 
     /*(6)*/memcpy(opcodes + sizeof(MovtoRax) + sizeof(MovRaxtoRDI) + sizeof(Mov1toRBX) + sizeof(MovRBXtoRSI) + sizeof(MovtoRax), CallRax, sizeof(CallRax));
@@ -150,7 +167,12 @@ void WriteProcessMemory(const unsigned int rpid,user uregs={})
     for(int i=0;i<sizeof(data_opcodes);++i){
         ptrace(PTRACE_POKETEXT,rpid,uregs.regs.rip+i,data_opcodes[i]);
     }
+
+    printf("inside WriteProcessMemory setting RIP:%lx\n",uregs.regs.rip);
+    ptrace(PTRACE_SETREGS,rpid,NULL,&uregs);
 }
+
+
 
 int main()
 {
@@ -161,8 +183,8 @@ int main()
     {
     case 0://child process
     {
-        int y=execlp("../build-QTUI_App-Desktop_Qt_5_7_0_GCC_64bit-Debug/QTUI_App",0);
-        //int y=execlp("../build-Test-Desktop-Debug/Test",0);
+        int y=execlp("../build-QTUI_App-Desktop_Qt_5_11_2_GCC_64bit-Debug/QTUI_App",0);
+        //int y=execlp("../build-Test-Desktop_Qt_5_11_2_GCC_64bit-Debug/Test",0);
         break;
     }
     case -1:
@@ -171,7 +193,7 @@ int main()
         //parent continues execution
     }
 
-    sleep(1);//give it time
+    sleep(3);//give it time
 
     printf("pid of remote process:%u\n",rpid);
 
@@ -197,10 +219,22 @@ int main()
             ptrace(PTRACE_GETSIGINFO,tid,NULL,&siginfo);
             printf("signal caught:%u\n",siginfo.si_signo);
 
+            if(siginfo.si_signo == 11)
+            {
+                //some error has happened
+                printf("segv! abort\n");
+                dump(tid);
+                kill(rpid,9);
+                exit(0);
+            }
             if(siginfo.si_signo==5)  //SIGTRAP found
             {
+                printf("before mem restore\n");
+                dump(tid);
+
                 RestoreMemory(rpid,originalRegs);
-                //ptrace(PTRACE_DETACH,tid,0,0);  //not required since process is exiting, it will detach
+                ptrace(PTRACE_DETACH,tid,0,0);  //it will detach If  the  tracer  dies,  all  tracees  are  automatically  detached  and restarted, unless they were in group-stop.
+                sleep(2);
                 exit(0);//your work is done
             }
 
@@ -212,9 +246,22 @@ int main()
                 user uregs={};
                 ptrace(PTRACE_GETREGS,tid,NULL,&uregs);
 
+                printf("tracee stoped RIP:%lx\n",uregs.regs.rip);
+
+                size_t sztest=((0x1000+uregs.regs.rip&0xfffffffffffff000)-uregs.regs.rip);  //to find out how many bytes of memory from current EIP to page-end boundary
+                if(sztest<50+10)  //10 bytes extra to be safe
+                {
+                    printf("Could not attach, not enough memory to implant my opcodes, try again!\n");
+                    ptrace(PTRACE_DETACH,tid,0,0);
+                    exit(0);
+                }
+                else
+                {
+                    printf("testing (only) %lx\n",sztest);fflush(stdout);
+                }
                 originalRegs=uregs;  //do this once
-                ReadProcessMemory(rpid,uregs);
-                WriteProcessMemory(rpid,uregs);
+                ReadProcessMemory(tid,uregs);
+                WriteProcessMemory(tid,uregs);
             }
            /*
                  * long ptrace(enum __ptrace_request request, pid_t pid,
@@ -225,6 +272,20 @@ int main()
                               otherwise, no signal is delivered.  Thus, for example, the tracer can control whether a signal sent to the  tracee  is  delivered  or
                               not.  (addr is ignored.)
             */
+
+            //below is step wise debugging
+            for(int i=0;i<20 ;++i){ //run 20 instructions
+                printf("go %d step\n",i);
+                dump(tid,-3,3);
+                ptrace(PTRACE_SINGLESTEP, tid, 0, 0);  //let it continue one step
+                tid=waitpid(-1, &status, __WALL);
+            }
+            for(unsigned char c:data_opcodes)
+            {
+                printf("%x ",(unsigned int)c);
+            }
+            printf("\n");
+
             ptrace(PTRACE_CONT, tid, NULL,0);  //lets not send any signals back to the tracee
         }
         tid=waitpid(-1, &status, __WALL);
